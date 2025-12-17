@@ -1,6 +1,10 @@
 [package]
 name = "jj-fix-wrap"
-version = "0.1.0"
+version = "1.0.0"
+license = "0BSD"
+categories = ["command-line-utilities"]
 edition = "2024"
 
 [dependencies]
+getopts = { version = "0.2.24", default-features = false }
+tempfile = "3.23.0"
