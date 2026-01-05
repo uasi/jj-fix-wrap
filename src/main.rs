@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: 0BSD
 
+#![deny(clippy::undocumented_unsafe_blocks)]
+
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, exit};
 
 use getopts::Options;
@@ -10,22 +13,21 @@ use tempfile::tempdir;
 
 struct Config {
     in_place: bool,
-    file: Option<String>,
-    root: Option<String>,
-    tool: String,
-    args: Vec<String>,
+    file: Option<PathBuf>,
+    root: Option<PathBuf>,
+    tool: OsString,
+    args: Vec<OsString>,
 }
 
 impl Config {
-    fn file_basename(&self) -> Option<&str> {
+    fn file_basename(&self) -> Option<&OsStr> {
         let file = self.file.as_ref()?;
-        let name = Path::new(file).file_name()?;
-        name.to_str()
+        file.file_name()
     }
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<OsString> = std::env::args_os().collect();
 
     let config = match parse_args(&args) {
         Ok(c) => c,
@@ -41,10 +43,11 @@ fn main() {
     }
 }
 
-fn parse_args(args: &[String]) -> Result<Config, String> {
+fn parse_args(args: &[OsString]) -> Result<Config, String> {
     let Some(program) = args.first() else {
         return Err("no program name".to_string());
     };
+    let program = program.to_string_lossy();
 
     let mut opts = Options::new();
     opts.parsing_style(ParsingStyle::StopAtFirstFree);
@@ -76,12 +79,14 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         return Err("tool name required".to_string());
     }
 
+    let num_opts_consumed = args.len() - matches.free.len();
+
     Ok(Config {
         in_place: matches.opt_present("i"),
-        file: matches.opt_str("f").map(|s| s.to_string()),
-        root: matches.opt_str("r").map(|s| s.to_string()),
-        tool: matches.free[0].clone(),
-        args: matches.free[1..].into(),
+        file: matches.opt_str("f").map(PathBuf::from),
+        root: matches.opt_str("r").map(PathBuf::from),
+        tool: args[num_opts_consumed].clone(),
+        args: args[num_opts_consumed + 1..].to_vec(),
     })
 }
 
@@ -93,12 +98,8 @@ fn run(config: Config) -> Result<(), String> {
         .map_err(|e| format!("failed to read stdin: {e}"))?;
 
     let work_dir = tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
-    let input_name = config.file_basename().unwrap_or("input");
-    let input_path = work_dir
-        .path()
-        .join(input_name)
-        .to_string_lossy()
-        .into_owned();
+    let input_name = config.file_basename().unwrap_or(OsStr::new("input"));
+    let input_path = work_dir.path().join(input_name);
 
     std::fs::write(&input_path, &stdin_content)
         .map_err(|e| format!("failed to write input file: {e}"))?;
@@ -120,7 +121,7 @@ fn run(config: Config) -> Result<(), String> {
     Ok(())
 }
 
-fn write_output(output: &Output, input_path: &str, in_place: bool) -> Result<(), String> {
+fn write_output(output: &Output, input_path: &Path, in_place: bool) -> Result<(), String> {
     let mut stdout = io::stdout();
 
     if in_place {
@@ -140,28 +141,74 @@ fn write_output(output: &Output, input_path: &str, in_place: bool) -> Result<(),
         .map_err(|e| format!("failed to flush output: {e}"))
 }
 
-fn expand_args(config: &Config, input_path: &str) -> Vec<String> {
+fn expand_args(config: &Config, input_path: &Path) -> Vec<OsString> {
     const ESCAPED_PERCENT: &str = "\x00";
 
     config
         .args
         .iter()
         .map(|arg| {
-            let mut result = arg.clone();
+            let result = arg.clone();
 
-            result = result.replace("%%", ESCAPED_PERCENT);
+            let result = replace_os_str(result, "%%", OsStr::new(ESCAPED_PERCENT));
 
-            result = result.replace("%input", input_path);
-            if let Some(f) = &config.file {
-                result = result.replace("%file", f);
-            }
-            if let Some(r) = &config.root {
-                result = result.replace("%root", r);
-            }
+            let result = replace_os_str(result, "%input", input_path.as_os_str());
 
-            result = result.replace(ESCAPED_PERCENT, "%");
+            let result = if let Some(f) = &config.file {
+                replace_os_str(result, "%file", f.as_os_str())
+            } else {
+                result
+            };
 
-            result
+            let result = if let Some(r) = &config.root {
+                replace_os_str(result, "%root", r.as_os_str())
+            } else {
+                result
+            };
+
+            replace_os_str(result, ESCAPED_PERCENT, OsStr::new("%"))
         })
         .collect()
+}
+
+fn replace_os_str(haystack: OsString, needle: &str, replacement: &OsStr) -> OsString {
+    if needle.is_empty() {
+        return haystack;
+    }
+
+    let haystack = haystack.as_encoded_bytes();
+    let needle = needle.as_bytes();
+
+    let positions = {
+        let mut positions = Vec::new();
+        let mut i = 0;
+
+        while i <= haystack.len().saturating_sub(needle.len()) {
+            if haystack[i..].starts_with(needle) {
+                positions.push(i);
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+
+        positions
+    };
+
+    let mut result = OsString::new();
+    let mut last_pos = 0;
+
+    for &pos in &positions {
+        // SAFETY: The sub-slice `haystack[last_pos..pos]` is originated from the original
+        // OsString's encoded bytes, split only at boundaries defined by the needle which is a
+        // valid non-empty UTF-8 substring. This preserves the validity of the encoded bytes.
+        result.push(unsafe { OsStr::from_encoded_bytes_unchecked(&haystack[last_pos..pos]) });
+        result.push(replacement);
+        last_pos = pos + needle.len();
+    }
+
+    // SAFETY: Ditto for the remaining sub-slice `haystack[last_pos..]`.
+    result.push(unsafe { OsStr::from_encoded_bytes_unchecked(&haystack[last_pos..]) });
+
+    result
 }
